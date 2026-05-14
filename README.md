@@ -1,385 +1,286 @@
-# AI Agent with Memory & RAG System
+# AI Agent with Layered Memory and RAG
 
-一个先进的AI Agent项目，集成了**Claude的记忆系统**和**RAG（检索增强生成）**功能。这个项目适合作为简历项目展示，展示了现代AI应用开发的最佳实践。
+一个基于 `FastAPI + Claude + OpenAI Embeddings + Qdrant` 的 AI Agent 项目。
 
-## 🎯 项目特性
+这个项目的目标不是只做一个聊天接口，而是提供一套更接近真实 Agent 的后端骨架：
 
-### 1. **持久化记忆系统** (Independent Memory System)
-- ✅ 使用SQLite持久化存储用户记忆（而不是通过上下文传递）
-- ✅ 支持多种记忆类型：用户档案、对话总结、学习事实、用户偏好等
-- ✅ 自动记忆过期管理
-- ✅ 完整的搜索和检索功能
-- ✅ 独立于对话历史的永久存储
+- 有短期会话记忆
+- 有长期用户记忆
+- 有知识库检索增强生成
+- 有可持续演进到 `LangGraph` 的状态流结构
 
-### 2. **RAG (检索增强生成)**
-- ✅ 向量数据库支持
-- ✅ 语义相似度搜索
-- ✅ 文档索引和检索
-- ✅ 自动上下文注入
+## 核心能力
 
-### 3. **Claude API集成**
-- ✅ 使用最新的Claude模型
-- ✅ 自定义系统提示
-- ✅ 流式响应支持
-- ✅ 完整的错误处理
+### 1. 分层记忆
 
-### 4. **REST API**
-- ✅ FastAPI框架
-- ✅ 完整的CRUD操作
-- ✅ 自动API文档 (Swagger/OpenAPI)
-- ✅ 异步支持
+项目把记忆分成两层：
 
-### 5. **生产级代码**
-- ✅ 完整的日志系统
-- ✅ 环境配置管理
-- ✅ 单元测试
-- ✅ 错误处理和验证
+- 短期记忆
+  - 保存在当前 `conversation_history`
+  - 只把最近几轮对话送进 prompt
 
-## 📁 项目结构
+- 长期记忆
+  - 由 `MemoryManager` 管理
+  - 存储在 SQLite
+  - 支持：
+    - `memory_type`
+    - `summary`
+    - `tags`
+    - `importance`
+    - `confidence`
+    - `expires_at`
+    - `access_count`
 
-```
+### 2. RAG 检索
+
+当前 RAG 已经升级为真实向量检索：
+
+- 文档先切块
+- 使用 `OpenAI Embeddings` 生成向量
+- 使用本地 `Qdrant` 保存和检索向量
+- 查询时使用 dense retrieval
+- 再叠加轻量 lexical overlap 做重排
+
+默认 embedding 模型：
+
+- `text-embedding-3-small`
+
+### 3. Agent 编排
+
+`Agent.chat()` 当前流程：
+
+1. 分析用户输入
+2. 提取候选记忆
+3. 召回长期记忆
+4. 检索知识库 chunk
+5. 组装上下文
+6. 调用 Claude 生成回复
+7. 回写交互记忆和摘要
+
+这套结构已经很接近 `LangGraph` 的思路：
+
+- `LangChain` 更适合做组件层
+- `LangGraph` 更适合做后续的工作流编排层
+
+## 技术栈
+
+- Python 3.10+
+- FastAPI
+- Anthropic Claude
+- OpenAI Embeddings
+- Qdrant local mode
+- SQLite
+- Pytest
+
+## 项目结构
+
+```text
 ai_agent/
 ├── app/
-│   ├── agent/              # Agent核心逻辑
-│   │   └── agent.py        # 主Agent类
-│   ├── memory/             # 记忆系统
-│   │   └── memory_manager.py
-│   ├── rag/                # RAG系统
-│   │   └── retriever.py
-│   ├── api/                # API路由
+│   ├── agent/
+│   │   └── agent.py
+│   ├── api/
 │   │   └── routes.py
-│   ├── config/             # 配置管理
+│   ├── config/
 │   │   └── config.py
-│   └── utils/              # 工具函数
-│       └── logging_config.py
-├── data/                   # 数据存储
-│   ├── memories/          # 记忆数据库
-│   └── vectors/           # 向量数据库
-├── tests/                  # 测试文件
-├── server.py              # 主应用入口
-├── test.py                # 集成测试
-├── requirements.txt       # 依赖列表
-├── .env.example           # 环境配置示例
-└── README.md              # 本文件
+│   ├── memory/
+│   │   └── memory_manager.py
+│   ├── rag/
+│   │   └── retriever.py
+│   └── utils/
+├── data/
+│   ├── memories/
+│   │   └── memory.db
+│   └── qdrant/
+├── docs/
+│   └── MEMORY_RAG_REFACTOR.md
+├── tests/
+│   └── test_agent.py
+├── server.py
+├── requirements.txt
+└── .env.example
 ```
 
-## 🚀 快速开始
+## 关键文件
 
-### 1. 克隆项目
+- [app/agent/agent.py](c:/Users/Admin/Desktop/ai_agent/app/agent/agent.py)
+  - Agent 主流程
+
+- [app/memory/memory_manager.py](c:/Users/Admin/Desktop/ai_agent/app/memory/memory_manager.py)
+  - 长期记忆存储、召回、去重、统计
+
+- [app/rag/retriever.py](c:/Users/Admin/Desktop/ai_agent/app/rag/retriever.py)
+  - 文档切块、embedding、Qdrant 检索、上下文构建
+
+- [app/config/config.py](c:/Users/Admin/Desktop/ai_agent/app/config/config.py)
+  - 所有运行参数与路径配置
+
+## 安装
+
+### 1. 创建虚拟环境
+
 ```bash
-git clone <repository-url>
-cd ai_agent
+python -m venv .venv
+.venv\Scripts\activate
 ```
 
-### 2. 创建虚拟环境
+### 2. 安装依赖
+
 ```bash
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+python -m pip install -r requirements.txt
 ```
 
-### 3. 安装依赖
+### 3. 配置环境变量
+
+复制环境变量示例文件：
+
 ```bash
-pip install -r requirements.txt
+copy .env.example .env
 ```
 
-### 4. 配置环境变量
-```bash
-cp .env.example .env
-# 编辑 .env 文件，添加你的 CLAUDE_API_KEY
+至少需要配置：
+
+```env
+CLAUDE_API_KEY=your_claude_api_key_here
+OPENAI_API_KEY=your_openai_api_key_here
+ENVIRONMENT=development
 ```
 
-### 5. 运行测试
-```bash
-python test.py
+可选配置：
+
+```env
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMENSIONS=1536
+QDRANT_PATH=./data/qdrant
+QDRANT_COLLECTION_NAME=knowledge_chunks
 ```
 
-### 6. 启动服务器
+## 运行项目
+
 ```bash
 python server.py
-# 或使用 uvicorn
-uvicorn server:app --reload
 ```
 
-服务器将在 `http://localhost:8000` 启动
+启动后访问：
 
-访问 API 文档：`http://localhost:8000/docs`
+```text
+http://localhost:8000/docs
+```
 
-## 📚 API 端点
+## 测试
 
-### 对话
-```http
-POST /chat
-Content-Type: application/json
+运行测试：
 
+```bash
+python -m pytest tests\test_agent.py -q
+```
+
+当前已验证通过：
+
+```text
+11 passed
+```
+
+## API 概览
+
+### 聊天
+
+`POST /chat`
+
+示例请求：
+
+```json
 {
   "user_id": "user_001",
-  "message": "你好，告诉我关于Python的信息",
+  "message": "Tell me about Python web frameworks",
   "use_rag": true,
   "retrieve_k": 3
 }
 ```
 
-### 记忆管理
-```http
-# 添加记忆
-POST /memory/add
-{
-  "user_id": "user_001",
-  "memory_type": "user_preferences",
-  "content": "用户喜欢简洁的代码示例",
-  "metadata": {"importance": "high"}
-}
-
-# 获取记忆
-GET /memory/user_001?memory_type=user_preferences
-```
-
-### 知识库管理
-```http
-POST /knowledge/add
-{
-  "user_id": "user_001",
-  "documents": [
-    "Python是一种高级编程语言...",
-    "FastAPI是一个现代化的Web框架..."
-  ],
-  "metadata_list": [
-    {"topic": "python"},
-    {"topic": "fastapi"}
-  ]
-}
-```
-
-### 统计信息
-```http
-GET /stats/user_001
-```
-
-## 🔑 核心概念
-
-### 1. 记忆系统架构
-
-不同于传统的对话历史方式，本项目使用**独立的记忆系统**：
-
-```
-用户输入
-  ↓
-记忆检索 (从SQLite查询)
-  ↓
-RAG检索 (从向量数据库查询)
-  ↓
-系统提示 + 记忆上下文 + RAG上下文
-  ↓
-Claude API
-  ↓
-响应 + 新记忆更新
-```
-
-### 2. 记忆类型
-
-- **USER_PROFILE**: 用户基本信息
-- **CONVERSATION_SUMMARY**: 对话总结
-- **LEARNED_FACTS**: 学习的事实
-- **USER_PREFERENCES**: 用户偏好
-- **INTERACTION_HISTORY**: 交互历史
-- **DOCUMENT_CONTEXT**: 文档上下文
-
-### 3. RAG工作流
-
-1. **索引**: 将知识库文档转换为向量并存储
-2. **检索**: 根据用户查询找到相关文档
-3. **增强**: 将检索结果添加到模型提示
-4. **生成**: 模型基于增强的提示生成响应
-
-## 💡 使用示例
-
-### Python中使用
-
-```python
-from app.agent.agent import Agent
-from app.memory.memory_manager import MemoryType
-
-# 创建Agent实例
-agent = Agent(user_id="user_001")
-
-# 添加知识库文档
-agent.add_knowledge_documents([
-    "Python是一种解释型编程语言...",
-    "FastAPI是一个现代化的Web框架..."
-])
-
-# 添加用户记忆
-agent.add_to_memory(
-    memory_type=MemoryType.USER_PREFERENCES,
-    content="用户喜欢简洁的代码示例"
-)
-
-# 与Agent对话
-response = agent.chat(
-    "告诉我关于Python的信息",
-    use_rag=True
-)
-
-print(response)
+### 添加记忆
 
-# 获取用户记忆统计
-stats = agent.get_memory_stats()
-print(stats)
-```
+`POST /memory/add`
 
-### cURL中使用
+### 获取记忆
 
-```bash
-# 创建对话
-curl -X POST "http://localhost:8000/chat" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id": "user_001",
-    "message": "你好",
-    "use_rag": true
-  }'
+`GET /memory/{user_id}`
 
-# 获取用户统计
-curl -X GET "http://localhost:8000/stats/user_001"
-```
+### 添加知识库文档
 
-## 🛠️ 技术栈
+`POST /knowledge/add`
 
-| 层级 | 技术 |
-|-----|------|
-| **Web框架** | FastAPI, Uvicorn |
-| **AI模型** | Claude (Anthropic) |
-| **数据存储** | SQLite |
-| **向量运算** | NumPy, scikit-learn |
-| **类型检查** | Pydantic |
-| **测试** | pytest |
-| **日志** | Python logging |
+### 获取统计
 
-## 📊 性能特性
+`GET /stats/{user_id}`
 
-- **异步处理**: 使用FastAPI的async/await
-- **向量缓存**: 嵌入向量缓存减少重复计算
-- **数据库索引**: 优化查询性能
-- **批量操作**: 支持批量添加文档
-- **内存管理**: 自动清理过期数据
+## 当前配置说明
 
-## 🔒 安全特性
+### 记忆
 
-- ✅ API密钥管理（通过环境变量）
-- ✅ 输入验证（通过Pydantic）
-- ✅ CORS配置
-- ✅ 错误处理
-- ✅ 日志记录
+- `MEMORY_DB_PATH`
+  - 长期记忆 SQLite 路径
 
-## 📈 可扩展性
+- `MAX_MEMORIES`
+  - 每轮召回的最大记忆数
 
-本项目设计易于扩展：
+- `MEMORY_TTL_DAYS`
+  - 记忆保留周期
 
-```python
-# 自定义记忆类型
-class CustomMemoryType:
-    MY_TYPE = "my_custom_type"
+### RAG
 
-# 集成不同的embedding模型
-class OpenAIEmbedding(SimpleEmbeddingModel):
-    def encode(self, text: str):
-        # 实现OpenAI API调用
-        pass
+- `QDRANT_PATH`
+  - 本地 Qdrant 数据目录
 
-# 添加数据库支持
-# 支持PostgreSQL, MongoDB等
-```
+- `QDRANT_COLLECTION_NAME`
+  - 向量集合名称
 
-## 🧪 测试
+- `CHUNK_SIZE`
+  - 文本切块大小
 
-```bash
-# 运行集成测试
-python test.py
+- `CHUNK_OVERLAP`
+  - 切块重叠长度
 
-# 运行pytest
-pytest tests/ -v
+- `SIMILARITY_THRESHOLD`
+  - 检索结果最低分数阈值
 
-# 代码覆盖率
-pytest --cov=app tests/
-```
+- `DENSE_SCORE_WEIGHT`
+  - dense score 在重排中的权重
 
-## 📝 项目简历描述
+## 为什么这个项目更适合 LangGraph
 
-### 项目标题
-**AI Agent with Advanced Memory System and RAG**
+这个项目现在已经不是简单链式调用，而是明确的多阶段状态流：
 
-### 项目描述
-```
-开发了一个企业级AI Agent应用，具有以下核心特性：
+- 输入分析
+- 记忆提取
+- 记忆召回
+- 向量检索
+- 上下文构造
+- 回复生成
+- 记忆回写
 
-1. **独立记忆系统**：实现了持久化的用户记忆存储系统，支持多种记忆类型和自动过期管理，不依赖对话上下文传递。
+所以更适合：
 
-2. **RAG功能**：集成了检索增强生成技术，通过向量数据库和语义搜索提供上下文感知的生成。
+- `LangChain` 做组件
+- `LangGraph` 做编排
 
-3. **Claude API集成**：完整集成Anthropic的Claude API，实现自适应的系统提示和错误处理。
+## 下一步建议
 
-4. **REST API**：使用FastAPI开发，提供完整的CRUD操作和自动API文档。
+如果继续演进，推荐顺序是：
 
-5. **生产级代码**：完整的日志系统、环境配置管理、单元测试和错误处理。
+1. 接入真正的 `LangGraph`
+2. 把当前 Agent 流程迁移为 `StateGraph`
+3. 给长期记忆增加更强的结构化抽取
+4. 给 Qdrant 检索增加 metadata filter
+5. 增加 tracing 和可观测性
 
-技术栈：Python, FastAPI, Claude API, SQLite, NumPy, Pydantic
-```
+## 参考
 
-## 🔐 环境变量
+- OpenAI Embeddings
+  - https://platform.openai.com/docs/guides/embeddings
 
-```
-CLAUDE_API_KEY      # 必需：Claude API密钥
-ENVIRONMENT         # 可选：开发/生产环境
-API_HOST            # 可选：API主机地址
-API_PORT            # 可选：API端口
-LOG_LEVEL           # 可选：日志级别
-```
+- Qdrant Documentation
+  - https://qdrant.tech/documentation/
 
-## 📦 部署
-
-### Docker部署
-
-```dockerfile
-FROM python:3.9-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-
-CMD ["python", "server.py"]
-```
-
-```bash
-docker build -t ai-agent .
-docker run -p 8000:8000 -e CLAUDE_API_KEY=your_key ai-agent
-```
-
-### 云部署
-
-- **AWS**: ECR + ECS / Lambda
-- **Google Cloud**: Cloud Run / App Engine
-- **Azure**: Container Instances / App Service
-- **Heroku**: `git push heroku main`
-
-## 🤝 贡献
-
-欢迎提交Issue和Pull Request！
-
-## 📄 许可证
-
-MIT License
-
-## 🙋 支持
-
-有问题？请创建Issue或联系维护者。
-
----
-
-**最后更新**: 2026年5月8日
-
-**项目版本**: 1.0.0
-
-**Python版本**: 3.9+
+- FastAPI
+  - https://fastapi.tiangolo.com/

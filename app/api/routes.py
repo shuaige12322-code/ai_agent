@@ -1,8 +1,10 @@
 """
 FastAPI路由 - Agent API端点
 """
+import json
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.agent.agent import Agent
 import logging
@@ -27,6 +29,10 @@ class ChatResponse(BaseModel):
     user_id: str
     message: str
     response: str
+
+
+def _sse_event(event: str, data: Dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 class MemoryRequest(BaseModel):
@@ -90,6 +96,35 @@ async def chat(request: ChatRequest) -> ChatResponse:
     except Exception as e:
         logger.error(f"Error in chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/chat/stream")
+async def stream_chat(request: ChatRequest) -> StreamingResponse:
+    """Stream assistant responses as server-sent events."""
+
+    def event_stream():
+        try:
+            agent = get_agent(request.user_id)
+            for chunk in agent.stream_chat(
+                user_message=request.message,
+                use_rag=request.use_rag,
+                retrieve_k=request.retrieve_k,
+            ):
+                yield _sse_event("token", {"delta": chunk})
+            yield _sse_event("done", {"status": "complete"})
+        except Exception as e:
+            logger.error(f"Error in stream_chat: {e}")
+            yield _sse_event("error", {"detail": str(e)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/memory/add")

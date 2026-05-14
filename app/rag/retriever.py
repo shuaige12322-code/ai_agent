@@ -1,397 +1,348 @@
 """
-RAG (检索增强生成) 系统
-提供向量数据库和语义搜索功能
+RAG retrieval with real embeddings and a local Qdrant vector store.
+
+The dense retrieval stack is:
+- chunk documents
+- embed chunks with a configurable embedding provider
+- store vectors in local Qdrant
+- embed queries and search by vector similarity
+- apply a small lexical bonus for better exact-match precision
 """
-import json
 import logging
-import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
+import re
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-import sqlite3
-from datetime import datetime
+from typing import Any, Dict, List, Optional, Protocol, Sequence
+
+from openai import OpenAI
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qdrant_models
+
 from app.config.config import get_config
 
 logger = logging.getLogger(__name__)
 config = get_config()
 
 
-class Document:
-    """文档对象"""
-    
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r"\w+", text.lower())
+
+
+class EmbeddingProvider(Protocol):
+    """Embedding provider interface used by the vector store."""
+
+    def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
+        ...
+
+    def embed_query(self, text: str) -> List[float]:
+        ...
+
+    @property
+    def dimension(self) -> int:
+        ...
+
+
+class OpenAIEmbeddingProvider:
+    """OpenAI embeddings backed by a real embedding model."""
+
     def __init__(
         self,
-        doc_id: str,
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-        embedding: Optional[List[float]] = None,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        dimensions: Optional[int] = None,
     ):
-        self.doc_id = doc_id
-        self.content = content
-        self.metadata = metadata or {}
-        self.embedding = embedding
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为字典"""
+        self.api_key = api_key or config.OPENAI_API_KEY
+        self.model = model or config.EMBEDDING_MODEL
+        self.dimensions = dimensions or config.EMBEDDING_DIMENSIONS
+        self._dimension = self.dimensions
+        self._client: Optional[OpenAI] = None
+
+        if self.api_key:
+            self._client = OpenAI(api_key=self.api_key)
+
+    @property
+    def dimension(self) -> int:
+        if self._dimension is None:
+            raise RuntimeError(
+                "Embedding dimension is unknown. Configure EMBEDDING_DIMENSIONS."
+            )
+        return self._dimension
+
+    def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        if self._client is None:
+            raise RuntimeError("OPENAI_API_KEY is not configured.")
+
+        request_args: Dict[str, Any] = {
+            "model": self.model,
+            "input": list(texts),
+        }
+        if self.dimensions is not None:
+            request_args["dimensions"] = self.dimensions
+
+        response = self._client.embeddings.create(**request_args)
+        vectors = [item.embedding for item in response.data]
+        if vectors and self._dimension is None:
+            self._dimension = len(vectors[0])
+        return vectors
+
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed_texts([text])[0]
+
+
+class FakeEmbeddingProvider:
+    """Deterministic embedding provider used in tests."""
+
+    def __init__(self, dimension: int = 32):
+        self._dimension = dimension
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
+        vectors: List[List[float]] = []
+        for text in texts:
+            vector = [0.0] * self._dimension
+            for token in _tokenize(text):
+                index = hash(token) % self._dimension
+                vector[index] += 1.0
+            norm = sum(value * value for value in vector) ** 0.5
+            if norm:
+                vector = [value / norm for value in vector]
+            vectors.append(vector)
+        return vectors
+
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed_texts([text])[0]
+
+
+@dataclass
+class DocumentChunk:
+    chunk_id: str
+    document_id: str
+    content: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    token_count: int = 0
+
+    def to_payload(self) -> Dict[str, Any]:
         return {
-            "id": self.doc_id,
+            "chunk_id": self.chunk_id,
+            "document_id": self.document_id,
             "content": self.content,
             "metadata": self.metadata,
-            "embedding": self.embedding,
+            "token_count": self.token_count,
         }
 
 
-class SimpleEmbeddingModel:
-    """
-    简单的向量化模型
-    在实际项目中可以替换为OpenAI Embeddings或其他模型
-    """
-    
-    def __init__(self, dimension: int = 384):
-        self.dimension = dimension
-        self._cache = {}
-    
-    def encode(self, text: str) -> List[float]:
-        """
-        生成文本的嵌入向量
-        这是一个简化的实现，实际项目应使用真实的embedding模型
-        """
-        if text in self._cache:
-            return self._cache[text]
-        
-        # 使用简单的哈希和数值转换生成向量
-        import hashlib
-        hash_obj = hashlib.md5(text.encode())
-        hash_bytes = hash_obj.digest()
-        
-        # 将哈希转换为浮点向量
-        embedding = []
-        for i in range(self.dimension):
-            byte_index = i % len(hash_bytes)
-            value = (hash_bytes[byte_index] - 128) / 128.0
-            embedding.append(value)
-        
-        self._cache[text] = embedding
-        return embedding
-    
-    def similarity(
-        self,
-        embedding1: List[float],
-        embedding2: List[float],
-    ) -> float:
-        """计算两个向量的余弦相似度"""
-        arr1 = np.array(embedding1)
-        arr2 = np.array(embedding2)
-        
-        # 计算余弦相似度
-        dot_product = np.dot(arr1, arr2)
-        norm1 = np.linalg.norm(arr1)
-        norm2 = np.linalg.norm(arr2)
-        
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-        
-        return dot_product / (norm1 * norm2)
+class TextChunker:
+    """Simple word-based chunking with overlap."""
+
+    def __init__(self, chunk_size: int, chunk_overlap: int):
+        self.chunk_size = max(chunk_size, 50)
+        self.chunk_overlap = max(min(chunk_overlap, self.chunk_size - 1), 0)
+
+    def split_text(self, text: str) -> List[str]:
+        words = text.split()
+        if not words:
+            return []
+
+        chunks: List[str] = []
+        step = max(self.chunk_size - self.chunk_overlap, 1)
+        for start in range(0, len(words), step):
+            chunk_words = words[start : start + self.chunk_size]
+            if not chunk_words:
+                continue
+            chunks.append(" ".join(chunk_words))
+            if start + self.chunk_size >= len(words):
+                break
+        return chunks
 
 
 class VectorStore:
-    """向量存储 - 用于存储文档和其嵌入向量"""
-    
-    def __init__(self, db_path: Optional[str] = None):
-        """初始化向量存储"""
-        self.db_path = db_path or config.VECTOR_DB_PATH
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.embedding_model = SimpleEmbeddingModel()
-        self._init_db()
-    
-    def _init_db(self) -> None:
-        """初始化向量数据库"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS documents (
-                id TEXT PRIMARY KEY,
-                content TEXT NOT NULL,
-                metadata TEXT,
-                embedding TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    """Qdrant-backed vector store with local persistence."""
+
+    def __init__(
+        self,
+        collection_name: Optional[str] = None,
+        qdrant_path: Optional[str] = None,
+        embedding_provider: Optional[EmbeddingProvider] = None,
+    ):
+        self.collection_name = collection_name or config.QDRANT_COLLECTION_NAME
+        self.qdrant_path = qdrant_path or config.QDRANT_PATH
+        self.embedding_provider = embedding_provider or OpenAIEmbeddingProvider()
+        self.chunker = TextChunker(
+            chunk_size=config.CHUNK_SIZE,
+            chunk_overlap=config.CHUNK_OVERLAP,
+        )
+
+        if self.qdrant_path != ":memory:":
+            Path(self.qdrant_path).mkdir(parents=True, exist_ok=True)
+            self.client = QdrantClient(path=self.qdrant_path)
+        else:
+            self.client = QdrantClient(location=":memory:")
+
+        self._ensure_collection()
+
+    def close(self) -> None:
+        """Release local Qdrant resources, especially important on Windows."""
+        self.client.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _ensure_collection(self) -> None:
+        collections = self.client.get_collections().collections
+        exists = any(collection.name == self.collection_name for collection in collections)
+        if exists:
+            return
+
+        self.client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config=qdrant_models.VectorParams(
+                size=self.embedding_provider.dimension,
+                distance=qdrant_models.Distance.COSINE,
+            ),
+        )
+        logger.info(
+            "Created Qdrant collection %s at %s",
+            self.collection_name,
+            self.qdrant_path,
+        )
+
+    def add_documents(
+        self,
+        documents: List[str],
+        metadata_list: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[str]:
+        chunks: List[DocumentChunk] = []
+        doc_ids: List[str] = []
+
+        for index, document in enumerate(documents):
+            metadata = dict(metadata_list[index]) if metadata_list else {}
+            document_id = str(uuid.uuid4())
+            doc_ids.append(document_id)
+
+            for chunk_text in self.chunker.split_text(document):
+                chunk_id = str(uuid.uuid4())
+                chunk_metadata = dict(metadata)
+                chunk_metadata.setdefault("document_position", index)
+                chunks.append(
+                    DocumentChunk(
+                        chunk_id=chunk_id,
+                        document_id=document_id,
+                        content=chunk_text,
+                        metadata=chunk_metadata,
+                        token_count=len(chunk_text.split()),
+                    )
+                )
+
+        if not chunks:
+            return doc_ids
+
+        vectors = self.embedding_provider.embed_texts([chunk.content for chunk in chunks])
+        points = [
+            qdrant_models.PointStruct(
+                id=chunk.chunk_id,
+                vector=vector,
+                payload=chunk.to_payload(),
             )
-        """)
-        
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_created_at ON documents(created_at)
-        """)
-        
-        conn.commit()
-        conn.close()
-        logger.info(f"Vector store initialized at {self.db_path}")
-    
-    def add_documents(self, documents: List[Document]) -> List[str]:
-        """
-        添加文档到向量存储
-        
-        Args:
-            documents: 文档列表
-            
-        Returns:
-            添加的文档ID列表
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        doc_ids = []
-        now = datetime.now()
-        
-        for doc in documents:
-            # 生成嵌入向量
-            if doc.embedding is None:
-                doc.embedding = self.embedding_model.encode(doc.content)
-            
-            embedding_str = json.dumps(doc.embedding)
-            metadata_str = json.dumps(doc.metadata)
-            
-            cursor.execute("""
-                INSERT OR REPLACE INTO documents
-                (id, content, metadata, embedding, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                doc.doc_id,
-                doc.content,
-                metadata_str,
-                embedding_str,
-                now,
-                now,
-            ))
-            
-            doc_ids.append(doc.doc_id)
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"Added {len(documents)} documents to vector store")
+            for chunk, vector in zip(chunks, vectors)
+        ]
+
+        self.client.upsert(collection_name=self.collection_name, points=points)
+        logger.info("Added %s chunks into Qdrant collection %s", len(points), self.collection_name)
         return doc_ids
-    
+
     def search(
         self,
         query: str,
         k: int = 5,
-        threshold: float = 0.5,
-    ) -> List[Tuple[Document, float]]:
-        """
-        搜索相似的文档
-        
-        Args:
-            query: 查询文本
-            k: 返回文档数
-            threshold: 相似度阈值
-            
-        Returns:
-            (文档, 相似度)元组列表
-        """
-        # 获取查询的嵌入向量
-        query_embedding = self.embedding_model.encode(query)
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id, content, metadata, embedding
-            FROM documents
-            ORDER BY created_at DESC
-            LIMIT 100
-        """)
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        # 计算相似度并排序
-        results = []
-        for row in rows:
-            doc_id, content, metadata_str, embedding_str = row
-            embedding = json.loads(embedding_str)
-            
-            similarity = self.embedding_model.similarity(
-                query_embedding,
-                embedding,
+        threshold: float = 0.25,
+    ) -> List[Dict[str, Any]]:
+        query_vector = self.embedding_provider.embed_query(query)
+        response = self.client.query_points(
+            collection_name=self.collection_name,
+            query=query_vector,
+            limit=max(k * config.RAG_CANDIDATE_MULTIPLIER, k),
+            with_payload=True,
+        )
+        candidates = response.points
+
+        query_tokens = set(_tokenize(query))
+        ranked: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            payload = candidate.payload or {}
+            content = payload.get("content", "")
+            lexical_score = self._keyword_overlap(query_tokens, set(_tokenize(content)))
+            dense_score = float(candidate.score or 0.0)
+            final_score = dense_score * config.DENSE_SCORE_WEIGHT + lexical_score * (
+                1.0 - config.DENSE_SCORE_WEIGHT
             )
-            
-            if similarity >= threshold:
-                doc = Document(
-                    doc_id=doc_id,
-                    content=content,
-                    metadata=json.loads(metadata_str),
-                    embedding=embedding,
-                )
-                results.append((doc, similarity))
-        
-        # 按相似度排序
-        results.sort(key=lambda x: x[1], reverse=True)
-        
-        return results[:k]
-    
-    def get_document(self, doc_id: str) -> Optional[Document]:
-        """获取单个文档"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id, content, metadata, embedding
-            FROM documents
-            WHERE id = ?
-        """, (doc_id,))
-        
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row:
-            doc_id, content, metadata_str, embedding_str = row
-            return Document(
-                doc_id=doc_id,
-                content=content,
-                metadata=json.loads(metadata_str),
-                embedding=json.loads(embedding_str),
+            if final_score < threshold:
+                continue
+
+            ranked.append(
+                {
+                    "content": content,
+                    "metadata": payload.get("metadata", {}),
+                    "document_id": payload.get("document_id"),
+                    "chunk_id": payload.get("chunk_id", str(candidate.id)),
+                    "score": final_score,
+                    "dense_score": dense_score,
+                    "lexical_score": lexical_score,
+                }
             )
-        return None
-    
-    def delete_document(self, doc_id: str) -> bool:
-        """删除文档"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"Deleted document {doc_id}")
-        return True
-    
-    def get_all_documents(self, limit: int = 100) -> List[Document]:
-        """获取所有文档"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id, content, metadata, embedding
-            FROM documents
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (limit,))
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        documents = []
-        for row in rows:
-            doc_id, content, metadata_str, embedding_str = row
-            doc = Document(
-                doc_id=doc_id,
-                content=content,
-                metadata=json.loads(metadata_str),
-                embedding=json.loads(embedding_str),
-            )
-            documents.append(doc)
-        
-        return documents
-    
+
+        ranked.sort(key=lambda item: item["score"], reverse=True)
+        return ranked[:k]
+
     def clear_all(self) -> None:
-        """清空所有文档"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM documents")
-        conn.commit()
-        conn.close()
-        logger.info("Cleared all documents from vector store")
+        self.client.delete_collection(collection_name=self.collection_name)
+        self._ensure_collection()
+
+    @staticmethod
+    def _keyword_overlap(left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        return len(left & right) / len(left | right)
 
 
 class RAGRetriever:
-    """RAG检索器 - 管理文档检索和上下文生成"""
-    
+    """Knowledge retrieval facade used by the agent."""
+
     def __init__(self, vector_store: Optional[VectorStore] = None):
-        """初始化RAG检索器"""
         self.vector_store = vector_store or VectorStore()
-    
+
     def add_knowledge_base(
         self,
         documents: List[str],
         metadata_list: Optional[List[Dict[str, Any]]] = None,
     ) -> List[str]:
-        """
-        添加知识库文档
-        
-        Args:
-            documents: 文档内容列表
-            metadata_list: 元数据列表
-            
-        Returns:
-            添加的文档ID列表
-        """
-        import uuid
-        
-        doc_objects = []
-        for i, content in enumerate(documents):
-            doc_id = str(uuid.uuid4())
-            metadata = metadata_list[i] if metadata_list else {}
-            doc = Document(
-                doc_id=doc_id,
-                content=content,
-                metadata=metadata,
-            )
-            doc_objects.append(doc)
-        
-        return self.vector_store.add_documents(doc_objects)
-    
-    def retrieve(
-        self,
-        query: str,
-        k: int = 5,
-    ) -> List[Dict[str, Any]]:
-        """
-        检索相关文档
-        
-        Args:
-            query: 查询文本
-            k: 返回文档数
-            
-        Returns:
-            文档列表
-        """
-        results = self.vector_store.search(
+        return self.vector_store.add_documents(documents, metadata_list)
+
+    def retrieve(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        return self.vector_store.search(
             query=query,
             k=k,
             threshold=config.SIMILARITY_THRESHOLD,
         )
-        
-        return [
-            {
-                "content": doc.content,
-                "metadata": doc.metadata,
-                "similarity": float(similarity),
-            }
-            for doc, similarity in results
-        ]
-    
+
     def build_context(self, query: str, k: int = 3) -> str:
-        """
-        构建RAG上下文
-        
-        Args:
-            query: 查询文本
-            k: 检索文档数
-            
-        Returns:
-            格式化的上下文
-        """
-        retrieved_docs = self.retrieve(query, k=k)
-        
-        if not retrieved_docs:
-            return "No relevant documents found in the knowledge base."
-        
-        context = "Relevant documents from knowledge base:\n\n"
-        for i, doc in enumerate(retrieved_docs, 1):
-            context += f"[Document {i}]\n"
-            context += f"Content: {doc['content'][:500]}\n"
-            context += f"Relevance Score: {doc['similarity']:.2f}\n\n"
-        
-        return context
+        chunks = self.retrieve(query=query, k=k)
+        if not chunks:
+            return "No relevant knowledge base context was found."
+
+        lines = ["Relevant knowledge base context:"]
+        for index, chunk in enumerate(chunks, start=1):
+            source = chunk["metadata"].get("source", f"document-{index}")
+            lines.append(
+                f"[Chunk {index}] source={source} score={chunk['score']:.2f}\n"
+                f"{chunk['content'][:600]}"
+            )
+        return "\n\n".join(lines)

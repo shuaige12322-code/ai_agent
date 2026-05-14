@@ -1,0 +1,47 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 45 29% 97%;
+  --foreground: 210 18% 13%;
+  --card: 0 0% 100%;
+  --card-foreground: 210 18% 13%;
+  --primary: 192 65% 31%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 42 55% 91%;
+  --secondary-foreground: 210 18% 18%;
+  --muted: 45 20% 92%;
+  --muted-foreground: 210 10% 42%;
+  --accent: 18 91% 54%;
+  --accent-foreground: 0 0% 100%;
+  --border: 35 24% 84%;
+  --input: 35 24% 84%;
+  --ring: 192 65% 31%;
+  --danger: 0 72% 50%;
+  --danger-foreground: 0 0% 100%;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+  min-height: 100vh;
+  background-image:
+    radial-gradient(circle at top left, rgba(22, 135, 166, 0.12), transparent 30%),
+    radial-gradient(circle at top right, rgba(255, 124, 48, 0.14), transparent 22%),
+    linear-gradient(180deg, rgba(255,255,255,0.55), rgba(245,240,231,0.95));
+}
+
+.grid-shell {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr) 340px;
+}
+
+@media (max-width: 1200px) {
+  .grid-shell {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,10 +1,17 @@
 """
-Agent核心模块
-集成了记忆系统、RAG和Claude API
+Agent orchestration built around explicit state transitions.
+
+The flow now resembles a LangGraph-style pipeline:
+analyze input -> retrieve memory -> retrieve knowledge -> build prompt
+-> call model -> persist memories.
 """
 import logging
-from typing import List, Dict, Any, Optional
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, Generator, List, Optional
+
 import anthropic
+
 from app.config.config import get_config
 from app.memory.memory_manager import MemoryManager, MemoryType
 from app.rag.retriever import RAGRetriever
@@ -13,266 +20,322 @@ logger = logging.getLogger(__name__)
 config = get_config()
 
 
+@dataclass
 class ConversationMessage:
-    """对话消息"""
-    
-    def __init__(self, role: str, content: str):
-        self.role = role  # "user" or "assistant"
-        self.content = content
-    
+    role: str
+    content: str
+
     def to_dict(self) -> Dict[str, str]:
-        """转换为字典"""
         return {"role": self.role, "content": self.content}
 
 
 class Agent:
-    """
-    AI Agent - 集成记忆系统、RAG和Claude API
-    
-    核心特性：
-    1. 使用Claude的Memories API管理用户记忆（而非通过历史上下文）
-    2. 集成RAG系统用于增强生成
-    3. 保持独立的对话上下文
-    """
-    
-    def __init__(self, user_id: str):
-        """
-        初始化Agent
-        
-        Args:
-            user_id: 用户ID
-        """
+    """Stateful agent with layered memory and RAG-aware orchestration."""
+
+    def __init__(
+        self,
+        user_id: str,
+        memory_manager: Optional[MemoryManager] = None,
+        rag_retriever: Optional[RAGRetriever] = None,
+    ):
         self.user_id = user_id
-        self.client = anthropic.Anthropic(api_key=config.CLAUDE_API_KEY)
-        self.memory_manager = MemoryManager()
-        self.rag_retriever = RAGRetriever()
+        self.client = (
+            anthropic.Anthropic(api_key=config.CLAUDE_API_KEY)
+            if config.CLAUDE_API_KEY
+            else None
+        )
+        self.memory_manager = memory_manager or MemoryManager()
+        self.rag_retriever = rag_retriever or RAGRetriever()
         self.conversation_history: List[ConversationMessage] = []
-        
-        # 初始化用户记忆
         self._init_user_memories()
-    
+
     def _init_user_memories(self) -> None:
-        """初始化用户记忆"""
-        existing_memories = self.memory_manager.get_user_memories(
+        existing = self.memory_manager.get_user_memories(
             self.user_id,
             memory_type=MemoryType.USER_PROFILE,
             limit=1,
         )
-        
-        if not existing_memories:
-            # 创建初始用户档案
+        if not existing:
             self.memory_manager.create_memory(
                 user_id=self.user_id,
                 memory_type=MemoryType.USER_PROFILE,
-                content="New user profile created",
+                content="User profile initialized.",
                 metadata={"initialized": True},
+                importance=0.2,
+                confidence=1.0,
             )
-    
-    def _get_system_prompt(self) -> str:
-        """
-        生成系统提示
-        包含用户记忆信息和RAG上下文
-        """
-        # 获取用户记忆
-        user_memories = self.memory_manager.get_user_memories(
-            self.user_id,
+
+    def _analyze_user_message(self, user_message: str) -> Dict[str, Any]:
+        lowered = user_message.lower()
+        extracted_memories: List[Dict[str, Any]] = []
+
+        rules = [
+            (
+                MemoryType.USER_PREFERENCES,
+                [
+                    r"(?:i prefer|i like|i love)\s+(.+)",
+                    r"(?:please use)\s+(.+)",
+                    r"(?:我喜欢|我更喜欢|偏好)(.+)",
+                    r"(?:请用)(.+)",
+                ],
+                0.75,
+                ["preference"],
+            ),
+            (
+                MemoryType.USER_PROFILE,
+                [
+                    r"(?:i am|i'm|my role is)\s+(.+)",
+                    r"(?:my name is|call me)\s+(.+)",
+                    r"(?:我是|我是一名|我的工作是)(.+)",
+                    r"(?:我叫)(.+)",
+                ],
+                0.85,
+                ["profile"],
+            ),
+            (
+                MemoryType.TASK_CONTEXT,
+                [
+                    r"(?:my project|our project)\s+(.+)",
+                    r"(?:i am working on)\s+(.+)",
+                    r"(?:当前项目|这个项目|项目里)(.+)",
+                    r"(?:我正在做)(.+)",
+                ],
+                0.7,
+                ["project"],
+            ),
+        ]
+
+        for memory_type, patterns, confidence, tags in rules:
+            for pattern in patterns:
+                match = re.search(pattern, user_message, re.IGNORECASE)
+                if match:
+                    content = match.group(0).strip().rstrip("。.!?,，")
+                    extracted_memories.append(
+                        {
+                            "memory_type": memory_type,
+                            "content": content,
+                            "importance": (
+                                0.7 if memory_type != MemoryType.TASK_CONTEXT else 0.65
+                            ),
+                            "confidence": confidence,
+                            "tags": tags,
+                            "metadata": {"extracted_from": "user_message"},
+                        }
+                    )
+
+        intent = "question"
+        if any(keyword in lowered for keyword in ["fix", "修改", "重构", "optimize", "优化"]):
+            intent = "implementation"
+        elif any(keyword in lowered for keyword in ["what", "how", "为什么", "适合"]):
+            intent = "analysis"
+
+        return {"intent": intent, "extracted_memories": extracted_memories}
+
+    def _get_short_term_context(self) -> str:
+        if not self.conversation_history:
+            return "No short-term conversation context."
+
+        recent_messages = self.conversation_history[-config.MAX_SHORT_TERM_MESSAGES :]
+        lines = ["Recent conversation:"]
+        for message in recent_messages:
+            lines.append(f"- {message.role}: {message.content[:300]}")
+        return "\n".join(lines)
+
+    def _get_memory_context(self, user_message: str) -> str:
+        return self.memory_manager.build_memory_context(
+            user_id=self.user_id,
+            query=user_message,
             limit=config.MAX_MEMORIES,
         )
-        
-        memory_context = ""
-        if user_memories:
-            memory_context = "\n### User Memory Information:\n"
-            for memory in user_memories:
-                memory_context += f"- {memory.memory_type}: {memory.content}\n"
-        
-        system_prompt = """You are a helpful AI assistant with the ability to remember user information and retrieve relevant documents.
 
-Key responsibilities:
-1. Maintain coherent conversations
-2. Use user memory to personalize responses
-3. Reference relevant documents from the knowledge base when appropriate
-4. Update user memory based on new information learned
+    def _get_knowledge_context(self, user_message: str, use_rag: bool, retrieve_k: int) -> str:
+        if not use_rag or not config.RAG_ENABLED:
+            return "Knowledge retrieval disabled for this turn."
+        return self.rag_retriever.build_context(user_message, k=retrieve_k)
 
-Important: Never mention the memory system or technical implementation details to the user.
-Focus on providing helpful, natural responses.
-"""
-        
-        if memory_context:
-            system_prompt += memory_context
-        
-        return system_prompt
-    
-    def _extract_and_store_memory(self, response: str) -> None:
-        """
-        从响应中提取并存储新的记忆
-        
-        Args:
-            response: 模型的响应
-        """
-        # 这里可以实现更复杂的记忆提取逻辑
-        # 简单实现：如果对话包含特定关键字，就创建记忆
-        
-        key_phrases = [
-            "remember",
-            "i learned",
-            "you told me",
-            "my preference",
-            "my background",
-        ]
-        
-        response_lower = response.lower()
-        if any(phrase in response_lower for phrase in key_phrases):
-            # 可以创建对话总结记忆
-            if len(self.conversation_history) % 5 == 0:  # 每5条消息创建一个总结
-                self.memory_manager.create_memory(
-                    user_id=self.user_id,
-                    memory_type=MemoryType.CONVERSATION_SUMMARY,
-                    content=f"Recent conversation update",
-                    metadata={"message_count": len(self.conversation_history)},
-                )
-    
-    def chat(
+    def _build_system_prompt(
         self,
         user_message: str,
-        use_rag: bool = True,
-        retrieve_k: int = 3,
+        intent: str,
+        memory_context: str,
+        knowledge_context: str,
     ) -> str:
-        """
-        用户与Agent的对话
-        
-        Args:
-            user_message: 用户输入
-            use_rag: 是否使用RAG
-            retrieve_k: RAG检索文档数
-            
-        Returns:
-            Agent的响应
-        """
-        # 添加用户消息到历史
-        self.conversation_history.append(
-            ConversationMessage(role="user", content=user_message)
+        return f"""You are a helpful AI engineering assistant.
+
+Operating mode:
+- Keep answers accurate, practical, and implementation-focused.
+- Use durable user memory when it improves personalization.
+- Use knowledge-base context when it is relevant.
+- If memory and retrieved knowledge conflict, prefer the more specific and recent information.
+- Never mention internal memory or retrieval implementation unless explicitly asked.
+
+Current intent: {intent}
+
+{self._get_short_term_context()}
+
+{memory_context}
+
+{knowledge_context}
+
+Current user message:
+{user_message}
+"""
+
+    def _persist_extracted_memories(self, extracted_memories: List[Dict[str, Any]]) -> None:
+        for item in extracted_memories:
+            self.memory_manager.create_or_update_memory(
+                user_id=self.user_id,
+                memory_type=item["memory_type"],
+                content=item["content"],
+                metadata=item.get("metadata"),
+                importance=item.get("importance", 0.6),
+                confidence=item.get("confidence", 0.7),
+                tags=item.get("tags"),
+            )
+
+    def _persist_turn_summary(self) -> None:
+        recent_messages = self.conversation_history[-config.SUMMARIZE_EVERY_N_MESSAGES :]
+        if len(recent_messages) < config.SUMMARIZE_EVERY_N_MESSAGES:
+            return
+
+        summary_text = " | ".join(
+            f"{message.role}: {message.content[:120]}" for message in recent_messages
         )
-        
-        # 构建消息列表
-        messages = [msg.to_dict() for msg in self.conversation_history]
-        
-        # 获取系统提示
-        system_prompt = self._get_system_prompt()
-        
-        # 如果使用RAG，添加检索结果到系统提示
-        if use_rag and config.RAG_ENABLED:
-            rag_context = self.rag_retriever.build_context(
-                user_message,
-                k=retrieve_k,
-            )
-            system_prompt += f"\n\n### Knowledge Base Context:\n{rag_context}"
-        
-        # 调用Claude API
-        logger.info(f"Sending message from user {self.user_id}")
-        
-        try:
-            response = self.client.messages.create(
-                model=config.CLAUDE_MODEL,
-                max_tokens=config.MAX_TOKENS,
-                temperature=config.TEMPERATURE,
-                top_p=config.TOP_P,
-                system=system_prompt,
-                messages=messages,
-            )
-            
-            # 获取响应内容
-            assistant_message = response.content[0].text
-            
-            # 添加助手响应到历史
-            self.conversation_history.append(
-                ConversationMessage(role="assistant", content=assistant_message)
-            )
-            
-            # 从响应中提取并存储记忆
-            self._extract_and_store_memory(assistant_message)
-            
-            logger.info(f"Response generated for user {self.user_id}")
-            
-            return assistant_message
-            
-        except anthropic.APIError as e:
-            logger.error(f"API error: {e}")
-            raise
-    
+        self.memory_manager.create_or_update_memory(
+            user_id=self.user_id,
+            memory_type=MemoryType.CONVERSATION_SUMMARY,
+            content=summary_text,
+            metadata={"message_count": len(self.conversation_history)},
+            importance=0.45,
+            confidence=0.55,
+            tags=["summary"],
+        )
+
+    def _persist_interaction_memory(self, user_message: str, assistant_message: str) -> None:
+        self.memory_manager.create_memory(
+            user_id=self.user_id,
+            memory_type=MemoryType.INTERACTION_HISTORY,
+            content=f"user={user_message}\nassistant={assistant_message[:400]}",
+            metadata={"turn_length": len(user_message) + len(assistant_message)},
+            importance=0.15,
+            confidence=1.0,
+            tags=["interaction"],
+        )
+
+    def _generate_response(self, system_prompt: str) -> str:
+        if self.client is None:
+            raise RuntimeError("CLAUDE_API_KEY is not configured.")
+
+        response = self.client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=config.MAX_TOKENS,
+            temperature=config.TEMPERATURE,
+            top_p=config.TOP_P,
+            system=system_prompt,
+            messages=[message.to_dict() for message in self.conversation_history],
+        )
+        return response.content[0].text
+
+    def _generate_response_stream(self, system_prompt: str) -> Generator[str, None, None]:
+        if self.client is None:
+            raise RuntimeError("CLAUDE_API_KEY is not configured.")
+
+        with self.client.messages.stream(
+            model=config.CLAUDE_MODEL,
+            max_tokens=config.MAX_TOKENS,
+            temperature=config.TEMPERATURE,
+            top_p=config.TOP_P,
+            system=system_prompt,
+            messages=[message.to_dict() for message in self.conversation_history],
+        ) as stream:
+            for text in stream.text_stream:
+                if text:
+                    yield text
+
+    def _prepare_turn(
+        self, user_message: str, use_rag: bool, retrieve_k: int
+    ) -> Dict[str, Any]:
+        state = self._analyze_user_message(user_message)
+        self.conversation_history.append(ConversationMessage(role="user", content=user_message))
+        self._persist_extracted_memories(state["extracted_memories"])
+
+        memory_context = self._get_memory_context(user_message)
+        knowledge_context = self._get_knowledge_context(user_message, use_rag, retrieve_k)
+        system_prompt = self._build_system_prompt(
+            user_message=user_message,
+            intent=state["intent"],
+            memory_context=memory_context,
+            knowledge_context=knowledge_context,
+        )
+        return {"state": state, "system_prompt": system_prompt}
+
+    def _finalize_turn(self, user_message: str, assistant_message: str) -> None:
+        self.conversation_history.append(
+            ConversationMessage(role="assistant", content=assistant_message)
+        )
+        self._persist_interaction_memory(user_message, assistant_message)
+        self._persist_turn_summary()
+        self.memory_manager.cleanup_expired_memories()
+
+    def chat(self, user_message: str, use_rag: bool = True, retrieve_k: int = 3) -> str:
+        prepared = self._prepare_turn(user_message, use_rag, retrieve_k)
+        logger.info("Generating response for user %s", self.user_id)
+        assistant_message = self._generate_response(prepared["system_prompt"])
+        self._finalize_turn(user_message, assistant_message)
+        return assistant_message
+
+    def stream_chat(
+        self, user_message: str, use_rag: bool = True, retrieve_k: int = 3
+    ) -> Generator[str, None, None]:
+        prepared = self._prepare_turn(user_message, use_rag, retrieve_k)
+        logger.info("Streaming response for user %s", self.user_id)
+
+        chunks: List[str] = []
+        for chunk in self._generate_response_stream(prepared["system_prompt"]):
+            chunks.append(chunk)
+            yield chunk
+
+        assistant_message = "".join(chunks)
+        self._finalize_turn(user_message, assistant_message)
+
     def add_to_memory(
         self,
         memory_type: str,
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        显式添加信息到用户记忆
-        
-        Args:
-            memory_type: 记忆类型
-            content: 记忆内容
-            metadata: 元数据
-        """
-        self.memory_manager.create_memory(
+        self.memory_manager.create_or_update_memory(
             user_id=self.user_id,
             memory_type=memory_type,
             content=content,
             metadata=metadata,
+            importance=0.7,
+            confidence=0.95,
         )
-    
-    def get_user_memories(
-        self,
-        memory_type: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        获取用户的记忆
-        
-        Args:
-            memory_type: 记忆类型（可选）
-            
-        Returns:
-            记忆列表
-        """
+
+    def get_user_memories(self, memory_type: Optional[str] = None) -> List[Dict[str, Any]]:
         memories = self.memory_manager.get_user_memories(
-            self.user_id,
+            user_id=self.user_id,
             memory_type=memory_type,
             limit=config.MAX_MEMORIES,
         )
-        
         return [memory.to_dict() for memory in memories]
-    
+
     def add_knowledge_documents(
         self,
         documents: List[str],
         metadata_list: Optional[List[Dict[str, Any]]] = None,
     ) -> List[str]:
-        """
-        添加知识库文档
-        
-        Args:
-            documents: 文档列表
-            metadata_list: 元数据列表
-            
-        Returns:
-            添加的文档ID列表
-        """
-        doc_ids = self.rag_retriever.add_knowledge_base(
+        return self.rag_retriever.add_knowledge_base(
             documents=documents,
             metadata_list=metadata_list,
         )
-        
-        logger.info(f"Added {len(doc_ids)} documents to knowledge base")
-        return doc_ids
-    
+
     def clear_conversation(self) -> None:
-        """清除对话历史"""
         self.conversation_history = []
-        logger.info(f"Cleared conversation history for user {self.user_id}")
-    
+
     def get_conversation_history(self) -> List[Dict[str, str]]:
-        """获取对话历史"""
-        return [msg.to_dict() for msg in self.conversation_history]
-    
+        return [message.to_dict() for message in self.conversation_history]
+
     def get_memory_stats(self) -> Dict[str, Any]:
-        """获取用户的记忆统计"""
         return self.memory_manager.get_memory_stats(self.user_id)

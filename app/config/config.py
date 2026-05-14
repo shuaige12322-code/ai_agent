@@ -13,24 +13,33 @@ class Config:
     # Claude API 配置
     CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
     CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
     
     # 记忆系统配置
     MEMORY_ENABLED = True
-    MEMORY_STORAGE_PATH = os.path.join(
-        os.path.dirname(__file__), "../../data/memories"
+    MEMORY_DB_PATH = os.path.join(
+        os.path.dirname(__file__), "../../data/memories/memory.db"
     )
     MAX_MEMORIES = 10
     MEMORY_TTL_DAYS = 30
+    MAX_SHORT_TERM_MESSAGES = 8
+    SUMMARIZE_EVERY_N_MESSAGES = 6
     
     # RAG 配置
     RAG_ENABLED = True
-    VECTOR_DB_PATH = os.path.join(
-        os.path.dirname(__file__), "../../data/vectors"
+    QDRANT_PATH = os.getenv(
+        "QDRANT_PATH",
+        os.path.join(os.path.dirname(__file__), "../../data/qdrant"),
     )
-    CHUNK_SIZE = 1000
-    CHUNK_OVERLAP = 100
+    QDRANT_COLLECTION_NAME = os.getenv("QDRANT_COLLECTION_NAME", "knowledge_chunks")
+    CHUNK_SIZE = 220
+    CHUNK_OVERLAP = 40
     TOP_K_RESULTS = 5
-    SIMILARITY_THRESHOLD = 0.5
+    SIMILARITY_THRESHOLD = 0.25
+    RAG_CANDIDATE_MULTIPLIER = 3
+    DENSE_SCORE_WEIGHT = 0.85
     
     # 日志配置
     LOG_LEVEL = "INFO"

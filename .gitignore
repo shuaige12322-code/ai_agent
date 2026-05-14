@@ -135,3 +135,6 @@ data/
 logs/
 *.db
 *.db-journal
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
